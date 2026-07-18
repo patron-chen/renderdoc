@@ -84,6 +84,8 @@ public:
 
     // add to map to speed-up lookup in GetFunctionHook
     funchook_map[hook.function] = hook;
+
+    AddDynamicFunctionHook_locked(hook);
   }
 
   void AddLibHook(const rdcstr &name)
@@ -91,6 +93,20 @@ public:
     SCOPED_LOCK(lock);
     if(!libhooks.contains(name))
       libhooks.push_back(name);
+
+    AddDynamicLibHook_locked(name);
+  }
+
+  void AddDynamicFunctionHook(const FunctionHook &hook)
+  {
+    SCOPED_LOCK(lock);
+    AddDynamicFunctionHook_locked(hook);
+  }
+
+  void AddDynamicLibHook(const rdcstr &name)
+  {
+    SCOPED_LOCK(lock);
+    AddDynamicLibHook_locked(name);
   }
 
   void AddHookCallback(const rdcstr &name, FunctionLoadCallback callback)
@@ -131,6 +147,18 @@ public:
     return funchook_map[name];
   }
 
+  rdcarray<rdcstr> GetDynamicLibHooks()
+  {
+    SCOPED_LOCK(lock);
+    return dynamic_libhooks;
+  }
+
+  FunctionHook GetDynamicFunctionHook(const rdcstr &name)
+  {
+    SCOPED_LOCK(lock);
+    return dynamic_funchook_map[name];
+  }
+
   bool IsLibHook(const rdcstr &path)
   {
     SCOPED_LOCK(lock);
@@ -159,6 +187,31 @@ public:
     }
 
     return false;
+  }
+
+  bool IsDynamicLibHook(void *handle)
+  {
+    SCOPED_LOCK(lock);
+    for(const rdcstr &lib : dynamic_libhooks)
+    {
+      void *libHandle = dlopen(lib.c_str(), RTLD_NOLOAD);
+      if(libHandle == handle)
+        return true;
+    }
+
+    return false;
+  }
+
+  void SetDynamicFunctionDispatched(const rdcstr &name)
+  {
+    SCOPED_LOCK(lock);
+    dynamic_dispatched.insert(name);
+  }
+
+  bool WasDynamicFunctionDispatched(const rdcstr &name)
+  {
+    SCOPED_LOCK(lock);
+    return dynamic_dispatched.find(name) != dynamic_dispatched.end();
   }
 
   bool IsHooked(void *handle)
@@ -195,12 +248,29 @@ public:
   }
 
 private:
+  void AddDynamicFunctionHook_locked(const FunctionHook &hook)
+  {
+    dynamic_funchook_map[hook.function] = hook;
+  }
+
+  void AddDynamicLibHook_locked(const rdcstr &name)
+  {
+    if(!dynamic_libhooks.contains(name))
+      dynamic_libhooks.push_back(name);
+  }
+
   std::set<rdcstr> hooked_soname_already;
   std::set<void *> hooked_handle_already;
 
   rdcarray<FunctionHook> funchooks;
   std::map<rdcstr, FunctionHook> funchook_map;
   rdcarray<rdcstr> libhooks;
+
+  // These survive ClearHooks(), which only switches successful interceptor-lib hooks away from
+  // the PLT fallback. Dynamic symbol lookup must still be able to return those wrappers.
+  std::map<rdcstr, FunctionHook> dynamic_funchook_map;
+  rdcarray<rdcstr> dynamic_libhooks;
+  std::set<rdcstr> dynamic_dispatched;
 
   std::map<rdcstr, rdcarray<FunctionLoadCallback>> hookcallbacks;
 
@@ -419,6 +489,31 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
   return 0;
 }
 
+static void PatchLibraryContaining(void *symbol)
+{
+  if(symbol == NULL)
+    return;
+
+  Dl_info dlInfo = {};
+  if(dladdr(symbol, &dlInfo) == 0 || dlInfo.dli_fbase == NULL || dlInfo.dli_fname == NULL)
+    return;
+
+  const ElfW(Ehdr) *ehdr = (const ElfW(Ehdr) *)dlInfo.dli_fbase;
+  if(ehdr->e_ident[0] != ELFMAG0 || ehdr->e_ident[1] != ELFMAG1 || ehdr->e_ident[2] != ELFMAG2 ||
+     ehdr->e_ident[3] != ELFMAG3)
+    return;
+
+  struct dl_phdr_info phdrInfo = {};
+  phdrInfo.dlpi_addr = (ElfW(Addr))dlInfo.dli_fbase;
+  phdrInfo.dlpi_name = dlInfo.dli_fname;
+  phdrInfo.dlpi_phdr = (const ElfW(Phdr) *)(phdrInfo.dlpi_addr + (ElfW(Addr))ehdr->e_phoff);
+  phdrInfo.dlpi_phnum = ehdr->e_phnum;
+
+  // Android linker namespaces can hide a dlopen'd library from dl_iterate_phdr. A symbol returned
+  // by dlsym still gives us enough ELF metadata to patch that library's imports directly.
+  dl_iterate_callback(&phdrInfo, sizeof(phdrInfo), NULL);
+}
+
 // android has a special dlopen that passes the caller address in.
 typedef void *(*pfn__loader_dlopen)(const char *filename, int flags, const void *caller_addr);
 
@@ -491,15 +586,70 @@ extern "C" __attribute__((visibility("default"))) void *hooked_android_dlopen_ex
 
 bool hooks_suppressed();
 
+enum class DlsymFallbackReason
+{
+  NullArgument = 0,
+  Suppressed,
+  UnknownSymbol,
+  NonTargetLibrary,
+  Count,
+};
+
+static void LogDlsymFallbackOnce(DlsymFallbackReason reason, const char *symbol)
+{
+  static bool logged[(size_t)DlsymFallbackReason::Count] = {};
+  static Threading::CriticalSection lock;
+  SCOPED_LOCK(lock);
+
+  if(logged[(size_t)reason])
+    return;
+
+  logged[(size_t)reason] = true;
+
+  switch(reason)
+  {
+    case DlsymFallbackReason::NullArgument:
+      RDCDEBUG("Android dlsym dispatch used original symbol because handle or symbol was null");
+      break;
+    case DlsymFallbackReason::Suppressed:
+      RDCDEBUG(
+          "Android dlsym dispatch used original symbol because RenderDoc hooking was suppressed");
+      break;
+    case DlsymFallbackReason::UnknownSymbol:
+      RDCDEBUG("Android dlsym dispatch used original symbol because %s has no registered wrapper",
+               symbol);
+      break;
+    case DlsymFallbackReason::NonTargetLibrary:
+      RDCDEBUG("Android dlsym dispatch used original %s because its handle is not a target library",
+               symbol);
+      break;
+    case DlsymFallbackReason::Count: break;
+  }
+}
+
 extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handle, const char *symbol)
 {
-  if(handle == NULL || symbol == NULL || hooks_suppressed())
+  if(handle == NULL || symbol == NULL)
+  {
+    LogDlsymFallbackOnce(DlsymFallbackReason::NullArgument, symbol);
     return dlsym(handle, symbol);
+  }
 
-  const FunctionHook repl = GetHookInfo().GetFunctionHook(symbol);
+  if(hooks_suppressed())
+  {
+    LogDlsymFallbackOnce(DlsymFallbackReason::Suppressed, symbol);
+    return dlsym(handle, symbol);
+  }
+
+  const FunctionHook repl = GetHookInfo().GetDynamicFunctionHook(symbol);
 
   if(repl.hook == NULL)
-    return dlsym(handle, symbol);
+  {
+    LogDlsymFallbackOnce(DlsymFallbackReason::UnknownSymbol, symbol);
+    void *ret = dlsym(handle, symbol);
+    PatchLibraryContaining(ret);
+    return ret;
+  }
 
   if(!GetHookInfo().IsHooked(handle))
   {
@@ -509,13 +659,23 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
 
   HOOK_DEBUG_PRINT("Got dlsym for %s which we want in %p...", symbol, handle);
 
-  if(GetHookInfo().IsLibHook(handle))
+  if(GetHookInfo().IsDynamicLibHook(handle))
   {
-    HOOK_DEBUG_PRINT("identified dlsym(%s) we want to interpose! returning %p", symbol, repl.hook);
+    GetHookInfo().SetDynamicFunctionDispatched(symbol);
+
+    static std::set<rdcstr> loggedSymbols;
+    static Threading::CriticalSection loggedSymbolsLock;
+    {
+      SCOPED_LOCK(loggedSymbolsLock);
+      if(loggedSymbols.insert(symbol).second)
+        RDCLOG("Android dlsym dispatch replaced %s with RenderDoc wrapper %p", symbol, repl.hook);
+    }
     return repl.hook;
   }
 
   void *ret = dlsym(handle, symbol);
+  PatchLibraryContaining(ret);
+  LogDlsymFallbackOnce(DlsymFallbackReason::NonTargetLibrary, symbol);
   Dl_info info = {};
   dladdr(ret, &info);
   HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
@@ -542,8 +702,11 @@ static void InstallHooksCommon()
   else
   {
     RDCWARN("Couldn't find __loader_dlopen, falling back to slow path for dlopen hooking");
-    LibraryHooks::RegisterFunctionHook("", FunctionHook("dlsym", NULL, (void *)&hooked_dlsym));
   }
+
+  // Swappy and other dispatch libraries resolve graphics entry points dynamically. Hook their
+  // dlsym import even when __loader_dlopen is available so Present still reaches RenderDoc.
+  LibraryHooks::RegisterFunctionHook("", FunctionHook("dlsym", NULL, (void *)&hooked_dlsym));
 
   LibraryHooks::RegisterFunctionHook(
       "", FunctionHook("android_dlopen_ext", NULL, (void *)&hooked_android_dlopen_ext));
@@ -709,6 +872,47 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
   GetHookInfo().AddFunctionHook(hook);
 }
 
+void LibraryHooks::RegisterDynamicLibraryHook(const char *libraryName)
+{
+  HOOK_DEBUG_PRINT("Registering dynamic library hook for %s", libraryName);
+  GetHookInfo().AddDynamicLibHook(libraryName);
+
+  // Make the handle available for exact handle matching without putting this library through
+  // interceptor-lib's exported-function patching.
+  dlopen(libraryName, RTLD_NOW);
+}
+
+void LibraryHooks::RegisterDynamicFunctionHook(const FunctionHook &hook)
+{
+  HOOK_DEBUG_PRINT("Registering dynamic function hook for %s: %p", hook.function.c_str(), hook.hook);
+  GetHookInfo().AddDynamicFunctionHook(hook);
+
+  if(hook.orig && *hook.orig == NULL)
+  {
+    for(const rdcstr &lib : GetHookInfo().GetDynamicLibHooks())
+    {
+      void *handle = dlopen(lib.c_str(), RTLD_NOLOAD | RTLD_GLOBAL);
+      if(handle)
+      {
+        *hook.orig = dlsym(handle, hook.function.c_str());
+        if(*hook.orig)
+          break;
+      }
+    }
+  }
+}
+
+bool LibraryHooks::WasDynamicFunctionDispatched(const char *functionName)
+{
+  return functionName && GetHookInfo().WasDynamicFunctionDispatched(functionName);
+}
+
+void LibraryHooks::MarkDynamicFunctionDispatched(const char *functionName)
+{
+  if(functionName)
+    GetHookInfo().SetDynamicFunctionDispatched(functionName);
+}
+
 void LibraryHooks::RegisterLibraryHook(const char *name, FunctionLoadCallback cb)
 {
   GetHookInfo().AddLibHook(name);
@@ -733,6 +937,7 @@ void LibraryHooks::EndHookRegistration()
   // ensure we load all libraries we can immediately, so they are immediately hooked and don't get
   // loaded later.
   rdcarray<rdcstr> libs = GetHookInfo().GetLibHooks();
+  rdcarray<rdcstr> dynamicLibs = GetHookInfo().GetDynamicLibHooks();
   for(const rdcstr &lib : libs)
   {
     void *handle = dlopen(lib.c_str(), RTLD_GLOBAL);
@@ -760,11 +965,14 @@ void LibraryHooks::EndHookRegistration()
     }
   }
 
-  if(libs.empty())
+  if(libs.empty() && dynamicLibs.empty())
   {
-    RDCLOG("No library hooks registered, not doing any hooking");
+    RDCLOG("No library or dynamic dispatch hooks registered, not doing any hooking");
     return;
   }
+
+  if(libs.empty())
+    RDCLOG("Only dynamic dispatch hooks registered, installing common loader hooks");
 
   PatchHookedFunctions();
 
@@ -855,3 +1063,38 @@ bool hooks_suppressed()
 
   return (uintptr_t)Threading::GetTLSValue(suppressTLS) > 0;
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#include "catch/catch.hpp"
+
+static void android_dlsym_test_hook()
+{
+}
+
+TEST_CASE("Android dynamic symbol hook registry", "[android][hooks]")
+{
+  HookingInfo hooks;
+  FunctionHook hook("renderdoc_test_symbol", NULL, (void *)&android_dlsym_test_hook);
+
+  hooks.AddDynamicFunctionHook(hook);
+  CHECK(hooks.GetDynamicFunctionHook("renderdoc_test_symbol").hook == hook.hook);
+  CHECK(hooks.GetDynamicFunctionHook("renderdoc_unknown_symbol").hook == NULL);
+
+  hooks.AddDynamicLibHook("libc.so");
+  void *libc = dlopen("libc.so", RTLD_NOW | RTLD_LOCAL);
+  REQUIRE(libc != NULL);
+  CHECK(hooks.IsDynamicLibHook(libc));
+
+  // Successful interceptor-lib hooks are removed from the PLT tables, but their dynamic dispatch
+  // registrations must survive for dlsym callers.
+  hooks.AddFunctionHook(hook);
+  hooks.ClearHooks();
+  CHECK(hooks.GetFunctionHook("renderdoc_test_symbol").hook == NULL);
+  CHECK(hooks.GetDynamicFunctionHook("renderdoc_test_symbol").hook == hook.hook);
+  CHECK(hooks.IsDynamicLibHook(libc));
+
+  dlclose(libc);
+}
+
+#endif

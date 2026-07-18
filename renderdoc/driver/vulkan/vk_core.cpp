@@ -29,6 +29,7 @@
 #include "driver/ihv/amd/amd_rgp.h"
 #include "driver/ihv/nv/nv_aftermath.h"
 #include "driver/shaders/spirv/spirv_compile.h"
+#include "hooks/hooks.h"
 #include "jpeg-compressor/jpge.h"
 #include "maths/formatpacking.h"
 #include "serialise/rdcfile.h"
@@ -3566,6 +3567,20 @@ void WrappedVulkan::AdvanceFrame()
 void WrappedVulkan::Present(DeviceOwnedWindow devWnd)
 {
   bool activeWindow = devWnd.windowHandle == NULL || RenderDoc::Inst().IsActiveWindow(devWnd);
+
+#if ENABLED(RDOC_ANDROID)
+  // Android apps can leave an earlier splash API/window registered while Swappy presents through
+  // Vulkan. Surface recreation can also remove the active window and make another registered
+  // window active. Move back to the window proven to be presenting through the dynamic dispatch
+  // path before evaluating capture requests.
+  if(LibraryHooks::WasDynamicFunctionDispatched("vkQueuePresentKHR") && !activeWindow)
+  {
+    RenderDoc::Inst().SetActiveWindow(devWnd);
+    activeWindow = RenderDoc::Inst().IsActiveWindow(devWnd);
+    if(activeWindow)
+      RDCLOG("Android Vulkan dynamic Present selected/reselected its active capture window");
+  }
+#endif
 
   RenderDoc::Inst().AddActiveDriver(RDCDriver::Vulkan, true);
 
