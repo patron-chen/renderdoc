@@ -595,6 +595,43 @@ TEST_CASE("Read/writing large buffers", "[serialiser]")
   FileIO::Delete(filename);
 };
 
+TEST_CASE("Read/write large-size chunks across alignment boundaries", "[serialiser][chunks]")
+{
+  StreamWriter *buf = new StreamWriter(StreamWriter::DefaultScratchSize);
+
+  {
+    WriteSerialiser ser(buf, Ownership::Nothing);
+
+    byte payload[50] = {};
+
+    ser.BeginChunk(1, LARGE_CHUNK_SIZE);
+    ser.GetWriter()->Write(payload, sizeof(payload));
+    ser.EndChunk();
+
+    ser.WriteChunk(2);
+    ser.EndChunk();
+
+    REQUIRE_FALSE(ser.IsErrored());
+  }
+
+  {
+    ReadSerialiser ser(new StreamReader(buf->GetData(), buf->GetOffset()), Ownership::Stream);
+
+    CHECK(ser.ReadChunk<uint32_t>() == 1);
+    CHECK(ser.ChunkMetadata().length == 50);
+    ser.SkipCurrentChunk();
+    ser.EndChunk();
+
+    CHECK(ser.ReadChunk<uint32_t>() == 2);
+    ser.EndChunk();
+
+    REQUIRE_FALSE(ser.IsErrored());
+    CHECK(ser.GetReader()->AtEnd());
+  }
+
+  delete buf;
+};
+
 TEST_CASE("Read/write chunk metadata", "[serialiser]")
 {
   StreamWriter *buf = new StreamWriter(StreamWriter::DefaultScratchSize);

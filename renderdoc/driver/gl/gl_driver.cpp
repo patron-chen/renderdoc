@@ -28,6 +28,7 @@
 #include "common/common.h"
 #include "core/settings.h"
 #include "driver/shaders/spirv/spirv_compile.h"
+#include "hooks/hooks.h"
 #include "jpeg-compressor/jpge.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
@@ -2110,6 +2111,20 @@ void WrappedOpenGL::SwapBuffers(WindowingSystem winSystem, void *windowHandle)
   DeviceOwnedWindow devWnd(ctxdata.ctx, windowHandle);
 
   bool activeWindow = RenderDoc::Inst().IsActiveWindow(devWnd);
+
+#if ENABLED(RDOC_ANDROID)
+  const bool dynamicEGLPresent =
+      LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffers") ||
+      LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageEXT") ||
+      LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageKHR");
+  if(dynamicEGLPresent && !activeWindow)
+  {
+    RenderDoc::Inst().SetActiveWindow(devWnd);
+    activeWindow = RenderDoc::Inst().IsActiveWindow(devWnd);
+    if(activeWindow)
+      RDCLOG("Android EGL dynamic Present selected/reselected its active capture window");
+  }
+#endif
 
   // look at previous associations and decay any that are too old
   uint64_t ref = Timing::GetUnixTimestamp() - 5;    // 5 seconds

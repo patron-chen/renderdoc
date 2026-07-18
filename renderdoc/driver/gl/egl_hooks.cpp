@@ -534,6 +534,15 @@ HOOK_EXPORT EGLBoolean EGLAPIENTRY eglMakeCurrent_renderdoc_hooked(EGLDisplay di
 
 HOOK_EXPORT EGLBoolean EGLAPIENTRY eglSwapBuffers_renderdoc_hooked(EGLDisplay dpy, EGLSurface surface)
 {
+#if ENABLED(RDOC_ANDROID)
+  static int32_t loggedDynamicPresent = 0;
+  if(LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffers") &&
+     Atomic::CmpExch32(&loggedDynamicPresent, 0, 1) == 0)
+  {
+    RDCLOG("Android EGL Present entered RenderDoc through dynamic dlsym dispatch");
+  }
+#endif
+
   if(RenderDoc::Inst().IsReplayApp())
   {
     if(!EGL.SwapBuffers)
@@ -653,6 +662,15 @@ HOOK_EXPORT EGLBoolean EGLAPIENTRY eglSwapBuffersWithDamageEXT_renderdoc_hooked(
                                                                                 EGLint *rects,
                                                                                 EGLint n_rects)
 {
+#if ENABLED(RDOC_ANDROID)
+  static int32_t loggedDynamicPresent = 0;
+  if(LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageEXT") &&
+     Atomic::CmpExch32(&loggedDynamicPresent, 0, 1) == 0)
+  {
+    RDCLOG("Android EGL damage Present entered RenderDoc through dynamic dlsym dispatch");
+  }
+#endif
+
   if(RenderDoc::Inst().IsReplayApp())
   {
     if(!EGL.SwapBuffersWithDamageEXT)
@@ -688,6 +706,15 @@ HOOK_EXPORT EGLBoolean EGLAPIENTRY eglSwapBuffersWithDamageKHR_renderdoc_hooked(
                                                                                 EGLint *rects,
                                                                                 EGLint n_rects)
 {
+#if ENABLED(RDOC_ANDROID)
+  static int32_t loggedDynamicPresent = 0;
+  if(LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageKHR") &&
+     Atomic::CmpExch32(&loggedDynamicPresent, 0, 1) == 0)
+  {
+    RDCLOG("Android EGL damage Present entered RenderDoc through dynamic dlsym dispatch");
+  }
+#endif
+
   if(RenderDoc::Inst().IsReplayApp())
   {
     if(!EGL.SwapBuffersWithDamageKHR)
