@@ -38,3 +38,13 @@ In addition to the usual build requirements for native and android builds, windo
 Linux requires docker to build the tool in an isolated container for maximum compatibility, although using the above mentioned `--skipcompile` you could get around this by building locally.
 
 Both platforms require s phinx to be available in python, and in addition windows requires the HTML help workshop.
+
+## Local Android APK builds on Windows
+
+Use `build_android_apks.bat` from a normal Command Prompt or PowerShell session to generate and build stripped Release APKs for both supported ARM ABIs:
+
+```
+util\buildscripts\build_android_apks.bat
+```
+
+The script creates `build-android-release-arm32` and `build-android-release-arm64`, verifies both APK signatures, and copies the results to `x64\Development\plugins\android`. Run with `--help` for single-ABI, configure-only, toolchain-path, and parallel-build options.
