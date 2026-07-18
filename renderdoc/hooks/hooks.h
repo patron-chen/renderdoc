@@ -173,6 +173,15 @@ public:
   // onward function pointer
   static void RegisterFunctionHook(const char *libraryName, const FunctionHook &hook);
 
+#if ENABLED(RDOC_ANDROID)
+  // Register a symbol only for Android dlsym dispatch. This does not patch the exported function
+  // itself, which is important for APIs such as Vulkan that use a loader/layer architecture.
+  static void RegisterDynamicLibraryHook(const char *libraryName);
+  static void RegisterDynamicFunctionHook(const FunctionHook &hook);
+  static void MarkDynamicFunctionDispatched(const char *functionName);
+  static bool WasDynamicFunctionDispatched(const char *functionName);
+#endif
+
   // detect if an identifier is present in the current process - used as a marker to indicate
   // replay-type programs.
   static bool Detect(const char *identifier);

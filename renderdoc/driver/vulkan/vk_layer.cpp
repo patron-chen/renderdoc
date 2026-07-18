@@ -99,6 +99,71 @@ void KeepLayerAlive()
 }
 #endif
 
+#if ENABLED(RDOC_ANDROID)
+static PFN_vkGetDeviceProcAddr real_android_vkGetDeviceProcAddr = NULL;
+static PFN_vkQueuePresentKHR android_layer_vkQueuePresentKHR = NULL;
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+android_dynamic_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
+{
+  LibraryHooks::MarkDynamicFunctionDispatched("vkQueuePresentKHR");
+
+  static int32_t presentState = 0;
+  if(Atomic::CmpExch32(&presentState, 0, 1) == 0)
+    RDCLOG("Android Vulkan Present entered RenderDoc through dynamic vkGetDeviceProcAddr dispatch");
+  else if(Atomic::CmpExch32(&presentState, 1, 2) == 1)
+    RDCLOG("Android Vulkan dynamic Present dispatch is continuous");
+
+  return android_layer_vkQueuePresentKHR(queue, pPresentInfo);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+VK_LAYER_RENDERDOC_CaptureGetDeviceProcAddr(VkDevice device, const char *pName);
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL android_vkGetDeviceProcAddr(VkDevice device,
+                                                                            const char *pName)
+{
+  if(pName == NULL)
+    return NULL;
+
+  if(device != VK_NULL_HANDLE && WrappedVkDevice::IsAlloc((WrappedVkDevice *)device))
+  {
+    PFN_vkVoidFunction ret = VK_LAYER_RENDERDOC_CaptureGetDeviceProcAddr(device, pName);
+
+    // Return a distinct forwarding thunk for dynamically resolved Present. Besides making the
+    // diagnostic unambiguous, this keeps the layer's normal dispatch entry point untouched.
+    if(ret != NULL && !strcmp(pName, "vkQueuePresentKHR"))
+    {
+      static int32_t loggedQueuePresentLookup = 0;
+      if(Atomic::CmpExch32(&loggedQueuePresentLookup, 0, 1) == 0)
+        RDCLOG("Android dynamic vkGetDeviceProcAddr returned RenderDoc's vkQueuePresentKHR");
+
+      android_layer_vkQueuePresentKHR = (PFN_vkQueuePresentKHR)ret;
+      return (PFN_vkVoidFunction)&android_dynamic_vkQueuePresentKHR;
+    }
+
+    return ret;
+  }
+
+  if(!strcmp(pName, "vkQueuePresentKHR"))
+  {
+    static int32_t loggedForeignQueuePresentLookup = 0;
+    if(Atomic::CmpExch32(&loggedForeignQueuePresentLookup, 0, 1) == 0)
+      RDCLOG(
+          "Android dynamic vkGetDeviceProcAddr received a non-RenderDoc device for "
+          "vkQueuePresentKHR");
+  }
+
+  if(real_android_vkGetDeviceProcAddr)
+    return real_android_vkGetDeviceProcAddr(device, pName);
+
+  RDCWARN(
+      "Android Vulkan dynamic dispatch has no original vkGetDeviceProcAddr for non-RenderDoc "
+      "device");
+  return NULL;
+}
+#endif
+
 // we don't actually hook any modules here. This is just used so that it's called
 // at the right time in initialisation (after capture options are available) to
 // set environment variables
@@ -109,7 +174,14 @@ class VulkanHook : LibraryHook
   {
     RDCLOG("Registering Vulkan hooks");
 
-    // we don't register any library or function hooks because we use the layer system
+    // Vulkan normally uses only the layer system. On Android, dispatch libraries such as Swappy
+    // obtain vkGetDeviceProcAddr through dlsym(libvulkan), bypassing the layer's proc address.
+#if ENABLED(RDOC_ANDROID)
+    LibraryHooks::RegisterDynamicLibraryHook("libvulkan.so");
+    LibraryHooks::RegisterDynamicFunctionHook(
+        FunctionHook("vkGetDeviceProcAddr", (void **)&real_android_vkGetDeviceProcAddr,
+                     (void *)&android_vkGetDeviceProcAddr));
+#endif
 
     // we assume the implicit layer is registered - the UI will prompt the user about installing it.
     Process::RegisterEnvironmentModification(
@@ -287,6 +359,17 @@ VKAPI_ATTR VkResult VKAPI_CALL hooked_vkCreateInstance(const VkInstanceCreateInf
                                                        const VkAllocationCallbacks *,
                                                        VkInstance *pInstance)
 {
+#if ENABLED(RDOC_ANDROID)
+  // The app's native library is commonly loaded after RenderDoc's initial PLT scan. Refresh here,
+  // before Swappy initialises, so its dlsym import is intercepted reliably.
+  static int32_t refreshedLateLibraries = 0;
+  if(Atomic::CmpExch32(&refreshedLateLibraries, 0, 1) == 0)
+  {
+    RDCLOG("Refreshing Android hooks after the Vulkan application library loaded");
+    LibraryHooks::Refresh();
+  }
+#endif
+
   KeepLayerAlive();
 
   WrappedVulkan *core = new WrappedVulkan();
@@ -667,3 +750,27 @@ VK_LAYER_RENDERDOC_CaptureNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerI
   return VK_SUCCESS;
 }
 }
+
+#if ENABLED(RDOC_ANDROID) && ENABLED(ENABLE_UNIT_TESTS)
+
+#include "catch/catch.hpp"
+
+static PFN_vkVoidFunction VKAPI_CALL android_test_vkGetDeviceProcAddr(VkDevice, const char *)
+{
+  return (PFN_vkVoidFunction)&android_test_vkGetDeviceProcAddr;
+}
+
+TEST_CASE("Android Vulkan dynamic GDPA preserves non-RenderDoc devices", "[android][vulkan]")
+{
+  PFN_vkGetDeviceProcAddr previous = real_android_vkGetDeviceProcAddr;
+  real_android_vkGetDeviceProcAddr = &android_test_vkGetDeviceProcAddr;
+
+  VkDevice foreignDevice = (VkDevice)(uintptr_t)1;
+  CHECK(android_vkGetDeviceProcAddr(foreignDevice, "vkQueuePresentKHR") ==
+        (PFN_vkVoidFunction)&android_test_vkGetDeviceProcAddr);
+  CHECK(android_vkGetDeviceProcAddr(foreignDevice, NULL) == NULL);
+
+  real_android_vkGetDeviceProcAddr = previous;
+}
+
+#endif
