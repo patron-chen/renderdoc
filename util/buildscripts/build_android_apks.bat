@@ -20,10 +20,11 @@ echo   -NoCopy               Do not copy APKs to x64\Development\plugins\android
 echo   -Jobs N               Parallel build jobs. Default: processor count.
 echo   -AndroidSdk PATH      Android SDK root.
 echo   -AndroidNdk PATH      Android NDK root.
-echo   -JdkHome PATH         JDK containing javac, jar and keytool.
-echo   -Java8Home PATH       Java 8 JRE/JDK used by dx and apksigner.
-echo   -BuildToolsVersion V  Android build-tools version. Default: 26.0.1.
-echo   -AndroidPlatform P    Android platform. Default: android-23.
+echo   -JdkHome PATH         JDK containing java, javac, jar and keytool.
+echo   -HostCppCompiler PATH Windows C++ compiler used to build host helper tools.
+echo   -MakeProgram PATH     Make executable used by the MinGW Makefiles generator.
+echo   -BuildToolsVersion V  Android build-tools version. Default: newest version containing d8.
+echo   -AndroidPlatform P    Android platform. Default: android-28.
 echo.
 echo Examples:
 echo   build_android_apks.bat
