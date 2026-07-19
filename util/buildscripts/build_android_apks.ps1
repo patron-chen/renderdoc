@@ -30,9 +30,10 @@ param(
     [string]$AndroidSdk,
     [string]$AndroidNdk,
     [string]$JdkHome,
-    [string]$Java8Home,
-    [string]$BuildToolsVersion = '26.0.1',
-    [string]$AndroidPlatform = 'android-23',
+    [string]$HostCppCompiler,
+    [string]$MakeProgram,
+    [string]$BuildToolsVersion,
+    [string]$AndroidPlatform = 'android-28',
     [switch]$Help
 )
 
@@ -52,10 +53,11 @@ Options:
   -Jobs N               Parallel build jobs. Default: processor count.
   -AndroidSdk PATH      Android SDK root.
   -AndroidNdk PATH      Android NDK root.
-  -JdkHome PATH         JDK containing javac, jar and keytool.
-  -Java8Home PATH       Java 8 JRE/JDK used by dx and apksigner.
-  -BuildToolsVersion V  Android build-tools version. Default: 26.0.1.
-  -AndroidPlatform P    Android platform. Default: android-23.
+  -JdkHome PATH         JDK containing java, javac, jar and keytool.
+  -HostCppCompiler PATH Windows C++ compiler used to build host helper tools.
+  -MakeProgram PATH     Make executable used by the MinGW Makefiles generator.
+  -BuildToolsVersion V  Android build-tools version. Default: newest version containing d8.
+  -AndroidPlatform P    Android platform. Default: android-28.
 
 Examples:
   .\build_android_apks.ps1
@@ -104,45 +106,125 @@ function Invoke-Checked {
     }
 }
 
-function Get-JavaVersionText {
-    param([string]$JavaExecutable)
+function Get-BuildToolsVersionKey {
+    param([string]$VersionText)
 
-    $savedErrorActionPreference = $ErrorActionPreference
-    try {
-        # Windows PowerShell converts native stderr into error records when Stop is active.
-        $ErrorActionPreference = 'Continue'
-        return (& $JavaExecutable -version 2>&1 | Out-String)
+    $parsedVersion = [Version]'0.0'
+    if ([Version]::TryParse($VersionText, [ref]$parsedVersion)) {
+        return $parsedVersion
     }
-    finally {
-        $ErrorActionPreference = $savedErrorActionPreference
-    }
+
+    return [Version]'0.0'
 }
 
-function Find-Java8Home {
-    param([string]$ExplicitHome)
+function Resolve-ExecutableCommand {
+    param([string]$Candidate)
 
-    $candidate = Get-FirstDirectory @($ExplicitHome, $env:JAVA8_HOME)
-    if ($candidate) {
-        return $candidate
-    }
-
-    $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue
-    if (-not $javaCommand) {
+    if (-not $Candidate) {
         return $null
     }
-
-    $versionText = Get-JavaVersionText $javaCommand.Source
-    if ($versionText -notmatch 'version "1\.8\.') {
-        return $null
+    if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $Candidate).Path
     }
 
-    $javaItem = Get-Item -LiteralPath $javaCommand.Source -Force
-    $javaPath = $javaItem.FullName
-    if ($javaItem.PSObject.Properties['LinkType'] -and $javaItem.LinkType -and $javaItem.Target) {
-        $javaPath = [string]$javaItem.Target
+    $command = Get-Command $Candidate -CommandType Application -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
     }
 
-    return Split-Path -Parent (Split-Path -Parent $javaPath)
+    return $null
+}
+
+function Find-HostCppCompiler {
+    param([string]$ExplicitCompiler)
+
+    foreach ($candidate in @($ExplicitCompiler, $env:CXX, 'c++.exe', 'g++.exe')) {
+        $compiler = Resolve-ExecutableCommand $candidate
+        if ($compiler) {
+            return $compiler
+        }
+    }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+        $installations = @(
+            & $vswhere -latest -products '*' -property installationPath
+            & $vswhere -all -products '*' -property installationPath
+        ) | Where-Object { $_ } | Select-Object -Unique
+
+        foreach ($installation in $installations) {
+            foreach ($relativePath in @(
+                'VC\Tools\Llvm\x64\bin\clang++.exe',
+                'VC\Tools\Llvm\bin\clang++.exe'
+            )) {
+                $compiler = Resolve-ExecutableCommand (Join-Path $installation $relativePath)
+                if ($compiler) {
+                    return $compiler
+                }
+            }
+        }
+    }
+
+    $compiler = Resolve-ExecutableCommand 'clang++.exe'
+    if ($compiler) {
+        return $compiler
+    }
+
+    throw 'Windows host C++ compiler not found. Pass -HostCppCompiler or install Visual Studio LLVM/MinGW g++.'
+}
+
+function Find-MakeProgram {
+    param(
+        [string]$ExplicitProgram,
+        [string]$NdkRoot
+    )
+
+    foreach ($candidate in @(
+        $ExplicitProgram,
+        'mingw32-make.exe',
+        (Join-Path $NdkRoot 'prebuilt\windows-x86_64\bin\make.exe'),
+        (Join-Path $NdkRoot 'prebuilt\windows\bin\make.exe')
+    )) {
+        $program = Resolve-ExecutableCommand $candidate
+        if ($program) {
+            return $program
+        }
+    }
+
+    throw 'Make executable not found. Pass -MakeProgram or install MinGW Make.'
+}
+
+function Find-D8BuildTools {
+    param(
+        [string]$SdkRoot,
+        [string]$ExplicitVersion
+    )
+
+    $buildToolsRoot = Join-Path $SdkRoot 'build-tools'
+    if (-not (Test-Path -LiteralPath $buildToolsRoot -PathType Container)) {
+        throw "Android build-tools directory not found: $buildToolsRoot"
+    }
+
+    if ($ExplicitVersion) {
+        $candidate = Join-Path $buildToolsRoot $ExplicitVersion
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            throw "Android build-tools $ExplicitVersion not found: $candidate"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $candidate 'd8.bat') -PathType Leaf)) {
+            throw "Android build-tools $ExplicitVersion does not contain d8.bat. Select a modern build-tools version to use a current JDK."
+        }
+        return (Get-Item -LiteralPath $candidate)
+    }
+
+    $candidate = Get-ChildItem -LiteralPath $buildToolsRoot -Directory |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'd8.bat') -PathType Leaf } |
+        Sort-Object @{ Expression = { Get-BuildToolsVersionKey $_.Name }; Descending = $true }, Name -Descending |
+        Select-Object -First 1
+    if (-not $candidate) {
+        throw 'No Android build-tools version containing d8.bat was found. Install a modern Android SDK build-tools package.'
+    }
+
+    return $candidate
 }
 
 if ($Help) {
@@ -187,30 +269,24 @@ if (-not $AndroidNdk) {
 
 $JdkHome = Get-FirstDirectory @($JdkHome, $env:JAVA_HOME)
 if (-not $JdkHome) {
-    throw 'JDK not found. Pass -JdkHome or set JAVA_HOME to a JDK containing javac.'
-}
-
-$Java8Home = Find-Java8Home $Java8Home
-if (-not $Java8Home) {
-    throw 'Java 8 not found. Pass -Java8Home or put a Java 8 java.exe first in PATH.'
+    throw 'JDK not found. Pass -JdkHome or set JAVA_HOME to a JDK containing java and javac.'
 }
 
 $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+$java = Require-File (Join-Path $JdkHome 'bin\java.exe') 'java'
 $javac = Require-File (Join-Path $JdkHome 'bin\javac.exe') 'javac'
 $jar = Require-File (Join-Path $JdkHome 'bin\jar.exe') 'jar'
 $javadoc = Require-File (Join-Path $JdkHome 'bin\javadoc.exe') 'javadoc'
 $jdkKeytool = Require-File (Join-Path $JdkHome 'bin\keytool.exe') 'JDK keytool'
-$java8 = Require-File (Join-Path $Java8Home 'bin\java.exe') 'Java 8 runtime'
-$java8Keytool = Require-File (Join-Path $Java8Home 'bin\keytool.exe') 'Java 8 keytool'
-$buildTools = Join-Path $AndroidSdk "build-tools\$BuildToolsVersion"
+$HostCppCompiler = Find-HostCppCompiler $HostCppCompiler
+$MakeProgram = Find-MakeProgram $MakeProgram $AndroidNdk
+$buildToolsDirectory = Find-D8BuildTools $AndroidSdk $BuildToolsVersion
+$BuildToolsVersion = $buildToolsDirectory.Name
+$buildTools = $buildToolsDirectory.FullName
 $aapt = Require-File (Join-Path $buildTools 'aapt.exe') 'aapt'
+$d8 = Require-File (Join-Path $buildTools 'd8.bat') 'd8'
 $apksigner = Require-File (Join-Path $buildTools 'apksigner.bat') 'apksigner'
 $androidJar = Require-File (Join-Path $AndroidSdk "platforms\$AndroidPlatform\android.jar") 'Android platform'
-
-$java8Version = Get-JavaVersionText $java8
-if ($java8Version -notmatch 'version "1\.8\.') {
-    throw "-Java8Home must point to Java 8. Detected: $($java8Version.Trim())"
-}
 
 $targets = @()
 if ($Abi -eq 'all' -or $Abi -eq 'arm32') {
@@ -234,7 +310,9 @@ Write-Host "Repository: $repoRoot"
 Write-Host "Android SDK: $AndroidSdk"
 Write-Host "Android NDK: $AndroidNdk"
 Write-Host "JDK: $JdkHome"
-Write-Host "Java 8: $Java8Home"
+Write-Host "Host C++ compiler: $HostCppCompiler"
+Write-Host "Make: $MakeProgram"
+Write-Host "Android build-tools: $BuildToolsVersion"
 Write-Host "Targets: $($targets.Name -join ', ')"
 
 $env:ANDROID_SDK = $AndroidSdk
@@ -249,6 +327,7 @@ foreach ($target in $targets) {
         '-S', $repoRoot,
         '-B', $target.BuildDirectory,
         '-G', 'MinGW Makefiles',
+        "-DCMAKE_MAKE_PROGRAM=$($MakeProgram.Replace('\', '/'))",
         '-DBUILD_ANDROID=On',
         '-DCMAKE_BUILD_TYPE=Release',
         '-DSTRIP_ANDROID_LIBRARY=On',
@@ -256,7 +335,8 @@ foreach ($target in $targets) {
         "-DANDROID_PLATFORM=$AndroidPlatform",
         "-DANDROID_BUILD_TOOLS_VERSION=$BuildToolsVersion",
         "-DAPK_TARGET_ID=$AndroidPlatform",
-        "-DJava_JAVA_EXECUTABLE=$($java8.Replace('\', '/'))",
+        "-DHOST_NATIVE_CPP_COMPILER=$($HostCppCompiler.Replace('\', '/'))",
+        "-DJava_JAVA_EXECUTABLE=$($java.Replace('\', '/'))",
         "-DJava_JAVAC_EXECUTABLE=$($javac.Replace('\', '/'))",
         # CMake 3.31 still expects javah for this old branch. It is not invoked by the build.
         "-DJava_JAVAH_EXECUTABLE=$($javac.Replace('\', '/'))",
@@ -290,11 +370,8 @@ foreach ($target in $targets) {
     }
 
     $validateKeystoreArguments = @('-list', '-keystore', $keystore, '-storepass', 'android')
-    Invoke-Checked $java8Keytool $validateKeystoreArguments "Validate Java 8-compatible keystore for $($target.Name)"
+    Invoke-Checked $jdkKeytool $validateKeystoreArguments "Validate keystore for $($target.Name)"
 }
-
-# Android build-tools 26 dx/apksigner require Java 8 at execution time.
-$env:JAVA_HOME = $Java8Home
 
 foreach ($target in $targets) {
     $buildArguments = @('--build', $target.BuildDirectory, '--target', 'apk', '--parallel', "$Jobs")
