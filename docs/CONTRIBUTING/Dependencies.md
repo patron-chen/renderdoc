@@ -100,7 +100,7 @@ brew link qt5 --force
 
 To build for Android, you must download components of the Android SDK, the Android NDK, and Java Development Kit.
 
-RenderDoc is currently known to build with NDK 14b, SDK tools 3859397, SDK build-tools 26.0.1, SDK platform android-23, Java 8 (also known as 1.8). If you use different versions of any of these it is up to you to ensure you have compatible versions of all as otherwise build failures may occur as versions of some components may not be compatible with different (even newer) versions of other components.
+RenderDoc is currently known to build with NDK 14b, SDK tools 3859397, SDK build-tools 26.0.1, SDK platform android-28, Java 8 (also known as 1.8). If you use different versions of any of these it is up to you to ensure you have compatible versions of all as otherwise build failures may occur as versions of some components may not be compatible with different (even newer) versions of other components.
 
 If you've already got the tools required, simply set the following three environment variables:
 
@@ -131,7 +131,7 @@ cd %ANDROID_SDK%
 wget https://dl.google.com/android/repository/sdk-tools-windows-3859397.zip
 unzip sdk-tools-windows-3859397.zip
 cd tools\bin
-sdkmanager --sdk_root=%ANDROID_SDK% "build-tools;26.0.1" "platforms;android-23"
+sdkmanager --sdk_root=%ANDROID_SDK% "build-tools;26.0.1" "platforms;android-28"
 # Accept the license
 
 # Set up the Android NDK
@@ -163,7 +163,7 @@ pushd $ANDROID_SDK
 wget http://dl.google.com/android/repository/sdk-tools-linux-3859397.zip
 unzip sdk-tools-linux-3859397.zip
 cd tools/bin/
-./sdkmanager --sdk_root=$ANDROID_SDK "build-tools;26.0.1" "platforms;android-23"
+./sdkmanager --sdk_root=$ANDROID_SDK "build-tools;26.0.1" "platforms;android-28"
 # Accept the license
 
 # Set up Android NDK
@@ -191,7 +191,7 @@ pushd $ANDROID_SDK
 wget https://dl.google.com/android/repository/sdk-tools-darwin-3859397.zip
 unzip sdk-tools-darwin-3859397.zip
 cd tools/bin/
-./sdkmanager --sdk_root=$ANDROID_SDK "build-tools;26.0.1" "platforms;android-23"
+./sdkmanager --sdk_root=$ANDROID_SDK "build-tools;26.0.1" "platforms;android-28"
 # Accept the license
 
 # Set up Android NDK
