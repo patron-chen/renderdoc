@@ -186,8 +186,15 @@ if(ANDROID)
     endif()
 
     set(BUILD_TOOLS "${ANDROID_SDK_ROOT_PATH}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}")
-    set(RT_JAR "$ENV{JAVA_HOME}/jre/lib/rt.jar")
     set(JAVA_BIN "$ENV{JAVA_HOME}/bin")
+
+    if(${Java_VERSION} VERSION_LESS 9.0)
+        set(RT_JAR "$ENV{JAVA_HOME}/jre/lib/rt.jar")
+        set(JAVA_COMPILE_OPTIONS -source ${JAVA_TARGET} -target ${JAVA_TARGET} -bootclasspath ${RT_JAR})
+    else()
+        string(REGEX REPLACE "^1\\." "" JAVA_RELEASE_TARGET "${JAVA_TARGET}")
+        set(JAVA_COMPILE_OPTIONS --release ${JAVA_RELEASE_TARGET})
+    endif()
 
     string(REPLACE "\\" "/" ANDROID_JAR "${ANDROID_SDK_ROOT_PATH}/platforms/${APK_TARGET_ID}/android.jar")
     if(CMAKE_HOST_WIN32)
@@ -307,7 +314,7 @@ if(ANDROID)
 
     add_custom_command(OUTPUT ${APK_FILE} APPEND
                        COMMAND ${BUILD_TOOLS}/aapt package -f -m -S res -J src -M AndroidManifest.xml -I ${ANDROID_JAR}
-                       COMMAND ${JAVA_BIN}/javac -d ./obj -source ${JAVA_TARGET} -target ${JAVA_TARGET} -bootclasspath ${RT_JAR} -classpath "${CLASS_PATH}" -sourcepath src src/org/renderdoc/renderdoccmd/*.java
+                       COMMAND ${JAVA_BIN}/javac -d ./obj ${JAVA_COMPILE_OPTIONS} -classpath "${CLASS_PATH}" -sourcepath src src/org/renderdoc/renderdoccmd/*.java
                        COMMAND ${DEX_COMMAND}
                        COMMAND ${BUILD_TOOLS}/aapt package -f -M AndroidManifest.xml --version-code ${APK_VERSION_CODE} --version-name ${APK_VERSION_NAME} -S res -I ${ANDROID_JAR} -F RenderDocCmd-unaligned.apk bin libs
                        COMMAND ${BUILD_TOOLS}/zipalign -f 4 RenderDocCmd-unaligned.apk RenderDocCmd.apk

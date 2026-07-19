@@ -48,3 +48,9 @@ util\buildscripts\build_android_apks.bat
 ```
 
 The script creates `build-android-release-arm32` and `build-android-release-arm64`, verifies both APK signatures, and copies the results to `x64\Development\plugins\android`. Run with `--help` for single-ABI, configure-only, toolchain-path, and parallel-build options.
+
+The script uses one JDK from `JAVA_HOME` or `-JdkHome`; JDK 17 is recommended. It selects the newest installed Android build-tools version containing `d8` by default, avoiding the legacy `dx` tool and its Java 8 requirement. The default minimum Android API level is 28.
+
+Android cross-compilation also requires a Windows C++ compiler for host helper tools. The script uses `-HostCppCompiler` when provided, then searches `CXX`, MinGW in `PATH`, and Visual Studio LLVM installations.
+
+For the MinGW Makefiles generator, the script uses `-MakeProgram`, `mingw32-make.exe` from `PATH`, or the Android NDK's bundled `make.exe`, in that order.

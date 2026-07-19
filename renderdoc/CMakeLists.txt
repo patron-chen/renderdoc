@@ -487,19 +487,22 @@ set(data_objects)
 
 if(UNIX)
     # If we're cross-compiling, include-bin will get built for the target and we
-    # then can't execute it. Instead, we force calling c++ (which we can safely
-    # assume is present) directly to build the binary
+    # then can't execute it. Instead, use a host-native compiler directly.
 
     if(CMAKE_CROSSCOMPILING)
         set(HOST_NATIVE_CPP_COMPILER c++ CACHE STRING "Command to run to compile a .cpp into an executable. Default is just c++")
+        set(HOST_INCLUDE_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include-bin")
+        if(CMAKE_HOST_WIN32)
+            string(APPEND HOST_INCLUDE_BIN ".exe")
+        endif()
 
-        add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include-bin
+        add_custom_command(OUTPUT ${HOST_INCLUDE_BIN}
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-            COMMAND ${HOST_NATIVE_CPP_COMPILER} 3rdparty/include-bin/main.cpp -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include-bin
+            COMMAND ${HOST_NATIVE_CPP_COMPILER} 3rdparty/include-bin/main.cpp -o ${HOST_INCLUDE_BIN}
             DEPENDS 3rdparty/include-bin/main.cpp)
-        set(INCLUDE_BIN_EXE "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include-bin")
-        set(INCLUDE_BIN_DEP "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include-bin")
+        set(INCLUDE_BIN_EXE "${HOST_INCLUDE_BIN}")
+        set(INCLUDE_BIN_DEP "${HOST_INCLUDE_BIN}")
     else()
         add_executable(include-bin 3rdparty/include-bin/main.cpp)
         set(INCLUDE_BIN_EXE $<TARGET_FILE:include-bin>)
