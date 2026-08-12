@@ -194,8 +194,8 @@ private:
   QSemaphore m_CopyCapture;
   QSemaphore m_Disconnect;
   QSemaphore m_CycleWindow;
-  int m_CaptureNumFrames = 1;
-  int m_QueueCaptureFrameNum = 0;
+  uint32_t m_CaptureNumFrames = 1;
+  uint32_t m_QueueCaptureFrameNum = 0;
   int m_CaptureCounter = 0;
   QSemaphore m_Connected;
 

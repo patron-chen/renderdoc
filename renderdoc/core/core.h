@@ -610,7 +610,8 @@ public:
 
   bool IsActiveWindow(DeviceOwnedWindow devWnd);
   void GetActiveWindow(DeviceOwnedWindow &devWnd);
-  void TriggerCapture(uint32_t numFrames) { m_Cap = numFrames; }
+  RDCDriver GetActiveWindowDriver();
+  void TriggerCapture(uint32_t numFrames);
   uint32_t GetOverlayBits() { return m_Overlay; }
   void MaskOverlayBits(uint32_t And, uint32_t Or) { m_Overlay = (m_Overlay & And) | Or; }
   void QueueCapture(uint32_t frameNumber);
@@ -680,6 +681,7 @@ private:
   bool m_Replay;
 
   uint32_t m_Cap;
+  Threading::CriticalSection m_CaptureRequestLock;
 
   bool m_PrevFocus = false;
   bool m_PrevCap = false;
