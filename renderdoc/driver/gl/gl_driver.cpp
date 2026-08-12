@@ -2117,7 +2117,10 @@ void WrappedOpenGL::SwapBuffers(WindowingSystem winSystem, void *windowHandle)
       LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffers") ||
       LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageEXT") ||
       LibraryHooks::WasDynamicFunctionDispatched("eglSwapBuffersWithDamageKHR");
-  if(dynamicEGLPresent && !activeWindow)
+  // Vulkan is preferred over a lingering EGL splash surface. If Vulkan's active surface is
+  // destroyed, core selection moves to another registered capturer and EGL can become active.
+  if(dynamicEGLPresent && !activeWindow &&
+     RenderDoc::Inst().GetActiveWindowDriver() != RDCDriver::Vulkan)
   {
     RenderDoc::Inst().SetActiveWindow(devWnd);
     activeWindow = RenderDoc::Inst().IsActiveWindow(devWnd);

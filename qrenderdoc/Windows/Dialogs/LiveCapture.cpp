@@ -401,14 +401,14 @@ void LiveCapture::on_childProcesses_itemActivated(QListWidgetItem *item)
 
 void LiveCapture::on_queueCap_clicked()
 {
-  m_CaptureNumFrames = (int)ui->numFrames->value();
-  m_QueueCaptureFrameNum = (int)ui->captureFrame->value();
+  m_CaptureNumFrames = (uint32_t)ui->numFrames->value();
+  m_QueueCaptureFrameNum = (uint32_t)ui->captureFrame->value();
   m_QueueCapture.release();
 }
 
 void LiveCapture::on_triggerImmediateCapture_clicked()
 {
-  m_CaptureNumFrames = (int)ui->numFrames->value();
+  m_CaptureNumFrames = (uint32_t)ui->numFrames->value();
   m_TriggerCapture.release();
 }
 
@@ -639,7 +639,7 @@ void LiveCapture::captureCountdownTick()
 
   if(m_CaptureCounter == 0)
   {
-    m_CaptureNumFrames = (int)ui->numFrames->value();
+    m_CaptureNumFrames = (uint32_t)ui->numFrames->value();
     ui->triggerDelayedCapture->setEnabled(true);
     ui->triggerDelayedCapture->setText(tr("Trigger After Delay"));
     m_TriggerCapture.release();
@@ -1458,13 +1458,13 @@ void LiveCapture::connectionThreadEntry()
   {
     if(m_TriggerCapture.tryAcquire())
     {
-      conn->TriggerCapture((uint)m_CaptureNumFrames);
+      conn->TriggerCapture(m_CaptureNumFrames);
       m_CaptureNumFrames = 1;
     }
 
     if(m_QueueCapture.tryAcquire())
     {
-      conn->QueueCapture((uint32_t)m_QueueCaptureFrameNum, (uint32_t)m_CaptureNumFrames);
+      conn->QueueCapture(m_QueueCaptureFrameNum, m_CaptureNumFrames);
       m_QueueCaptureFrameNum = 0;
       m_CaptureNumFrames = 1;
     }
