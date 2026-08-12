@@ -1081,6 +1081,17 @@ void RenderDoc::GetActiveWindow(DeviceOwnedWindow &devWnd)
   devWnd = m_ActiveWindow;
 }
 
+RDCDriver RenderDoc::GetActiveWindowDriver()
+{
+  SCOPED_LOCK(m_CapturerListLock);
+
+  auto it = m_WindowFrameCapturers.find(m_ActiveWindow);
+  if(it != m_WindowFrameCapturers.end())
+    return it->second.FrameCapturer->GetFrameCaptureDriver();
+
+  return RDCDriver::Unknown;
+}
+
 IFrameCapturer *RenderDoc::MatchFrameCapturer(DeviceOwnedWindow devWnd)
 {
   // try and find the closest frame capture registered, and update
@@ -1249,7 +1260,10 @@ void RenderDoc::CycleActiveWindow()
 {
   SCOPED_LOCK(m_CapturerListLock);
 
-  m_Cap = 0;
+  {
+    SCOPED_LOCK(m_CaptureRequestLock);
+    m_Cap = 0;
+  }
 
   // can only shift focus if we have multiple windows
   if(m_WindowFrameCapturers.size() > 1)
@@ -1481,15 +1495,29 @@ rdcstr RenderDoc::GetOverlayText(RDCDriver driver, DeviceOwnedWindow devWnd, uin
   return overlayText;
 }
 
+void RenderDoc::TriggerCapture(uint32_t numFrames)
+{
+  SCOPED_LOCK(m_CaptureRequestLock);
+  m_Cap = numFrames;
+  RDCLOG("Trigger capture request received for %u frame(s)", numFrames);
+}
+
 void RenderDoc::QueueCapture(uint32_t frameNumber)
 {
+  SCOPED_LOCK(m_CaptureRequestLock);
+
   auto it = std::lower_bound(m_QueuedFrameCaptures.begin(), m_QueuedFrameCaptures.end(), frameNumber);
   if(it == m_QueuedFrameCaptures.end() || *it != frameNumber)
+  {
     m_QueuedFrameCaptures.insert(it - m_QueuedFrameCaptures.begin(), frameNumber);
+    RDCLOG("Queued capture request for frame %u", frameNumber);
+  }
 }
 
 bool RenderDoc::ShouldTriggerCapture(uint32_t frameNumber)
 {
+  SCOPED_LOCK(m_CaptureRequestLock);
+
   bool ret = m_Cap > 0;
 
   if(m_Cap > 0)
@@ -1501,7 +1529,7 @@ bool RenderDoc::ShouldTriggerCapture(uint32_t frameNumber)
   {
     if(*it < frameNumber)
     {
-      // discard, this frame is past.
+      RDCWARN("Discarding queued capture for past frame %u at current frame %u", *it, frameNumber);
     }
     else if((*it) == frameNumber)
     {
