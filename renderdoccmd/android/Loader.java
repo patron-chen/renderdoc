@@ -17,6 +17,15 @@ public class Loader extends android.app.NativeActivity
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        String command = getIntent().getStringExtra("renderdoccmd");
+        if(command != null && command.trim().split("\\s+")[0].equals("remoteserver")) {
+            Intent service = new Intent(this, RemoteServerService.class);
+            if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                startForegroundService(service);
+            else
+                startService(service);
+        }
+
         // if we're running on something older than Android M (6.0), return now
         // before requesting permissions as it's not supported
         if(Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
@@ -54,5 +63,11 @@ public class Loader extends android.app.NativeActivity
                 }
             } catch(Exception e) { }
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopService(new Intent(this, RemoteServerService.class));
+        super.onDestroy();
     }
 }
