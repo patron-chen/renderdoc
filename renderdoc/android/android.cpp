@@ -370,11 +370,8 @@ AndroidInstallPermissionCheckResult CheckAndroidServerInstallPermissions(const r
   // Command to check that the Android Server is queryable by other APKs (API>=30)
   Process::ProcessResult adbCheck =
       adbExecCommand(deviceID, "shell dumpsys package queries " + packageName, ".", true);
-  // parse command output
-  int32_t sectionStart = adbCheck.strStdout.find("forceQueryable");
-  int32_t sectionEnd = adbCheck.strStdout.find("queries via package name", sectionStart);
-  int32_t isPackageQueryable = adbCheck.strStdout.find(packageName, sectionStart, sectionEnd);
-  if(isPackageQueryable == -1)
+  if(adbCheck.retCode != 0 ||
+     !IsServerQueryable(adbCheck.strStdout + "\n" + adbCheck.strStderror, packageName))
   {
     RDCERR("Failed to install with 'force queryable' permissions.");
     return AndroidInstallPermissionCheckResult::NotQueryable;
@@ -533,7 +530,8 @@ RDResult InstallRenderDocServer(const rdcstr &deviceID)
       RDCLOG("Failed to install APK. stdout: %s, stderr: %s",
              adbInstall.strStdout.trimmed().c_str(), adbInstall.strStderror.trimmed().c_str());
       RDCLOG("Retrying...");
-      adbExecCommand(deviceID, "install -r \"" + apk + "\"");
+      // Retrying without --force-queryable can hide the layer APK from the target app.
+      InstallAPK(deviceID, apk, apiVersion);
 
       versionCheck = CheckAndroidServerVersion(deviceID, abi);
 
@@ -1151,6 +1149,8 @@ struct AndroidController : public IDeviceProtocolHandler
 
       rdcarray<rdcstr> packages;
       split(packagesOutput, packages, '\n');
+      for(rdcstr &package : packages)
+        package = package.trimmed();
 
       rdcarray<Android::ABI> abis = Android::GetSupportedABIs(deviceID);
 
@@ -1195,10 +1195,23 @@ struct AndroidController : public IDeviceProtocolHandler
            Android::CheckAndroidServerVersion(deviceID, Android::ABI::armeabi_v7a) ==
                Android::AndroidVersionCheckResult::NotInstalled);
 
-      if(!installedOK)
+      bool permissionsOK = true;
+      if(installedOK)
+      {
+        for(Android::ABI abi : abis)
+        {
+          rdcstr packageName = GetRenderDocPackageForABI(abi);
+          if(packages.contains("package:" + packageName) &&
+             Android::CheckAndroidServerInstallPermissions(deviceID, packageName, apiVersion) !=
+                 Android::AndroidInstallPermissionCheckResult::Correct)
+            permissionsOK = false;
+        }
+      }
+
+      if(!installedOK || !permissionsOK)
       {
         // if there was any existing package, remove it
-        if(!packages.empty())
+        if(!installedOK && !packages.empty())
         {
           if(Android::RemoveRenderDocAndroidServer(deviceID))
             RDCLOG("Uninstall of old server succeeded");
@@ -1206,7 +1219,7 @@ struct AndroidController : public IDeviceProtocolHandler
             RDCERR("Uninstall of old server failed");
         }
 
-        // If server is not detected or has been removed due to incompatibility, install it
+        // Reinstall in place when only package visibility needs repairing.
         result = Android::InstallRenderDocServer(deviceID);
         if(result != ResultCode::Succeeded && result != ResultCode::AndroidGrantPermissionsFailed &&
            result != ResultCode::AndroidAPKVerifyFailed)
@@ -1357,8 +1370,10 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
 
   RDResult result;
   uint32_t ident = RenderDoc_FirstTargetControlPort;
+  rdcstr layerConfigError;
 
-  AndroidController::m_Inst.Invoke([this, &result, &ident, packageAndActivity, intentArgs, opts]() {
+  AndroidController::m_Inst.Invoke([this, &result, &ident, &layerConfigError, packageAndActivity,
+                                    intentArgs, opts]() {
     rdcstr packageName = Android::GetPackageName(packageAndActivity);    // Remove leading '/' if any
 
     // adb shell cmd package resolve-activity -c android.intent.category.LAUNCHER com.jake.cube1
@@ -1385,8 +1400,6 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
     Android::adbExecCommand(m_deviceID, "shell setprop debug.vulkan.layers :", ".", true);
 
     bool hookWithJDWP = true;
-
-    rdcstr info;
 
     if(Android::SupportsNativeLayers(m_deviceID))
     {
@@ -1419,14 +1432,16 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
       }
 
       rdcstr layerPackage = GetRenderDocPackageForABI(abi);
-      Android::adbExecCommand(m_deviceID, "shell settings put global enable_gpu_debug_layers 1");
-      Android::adbExecCommand(m_deviceID, "shell settings put global gpu_debug_app " + packageName);
-      Android::adbExecCommand(m_deviceID,
-                              "shell settings put global gpu_debug_layer_app " + layerPackage);
-      Android::adbExecCommand(
-          m_deviceID, "shell settings put global gpu_debug_layers " RENDERDOC_VULKAN_LAYER_NAME);
-      Android::adbExecCommand(
-          m_deviceID, "shell settings put global gpu_debug_layers_gles " RENDERDOC_ANDROID_LIBRARY);
+      rdcarray<Android::GPUSetting> settings = {
+          {"enable_gpu_debug_layers", "1", {}},
+          {"gpu_debug_app", packageName, {}},
+          {"gpu_debug_layer_app", layerPackage, {}},
+          {"gpu_debug_layers", RENDERDOC_VULKAN_LAYER_NAME, {}},
+          {"gpu_debug_layers_gles", RENDERDOC_ANDROID_LIBRARY, {}},
+      };
+      for(Android::GPUSetting &setting : settings)
+        setting.writeResult = Android::adbExecCommand(
+            m_deviceID, "shell settings put global " + setting.name + " " + setting.value);
 
       // don't ignore the layers by default, only if we encounter an error
       Android::adbExecCommand(m_deviceID, "shell setprop debug.rdoc.IGNORE_LAYERS 0");
@@ -1434,38 +1449,20 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
       Process::ProcessResult check =
           Android::adbExecCommand(m_deviceID, "shell settings list global");
 
-      // check both since we don't know which one it will come out in
-      rdcstr inString = check.strStdout + check.strStderror;
-
-      // remove all whitespace. Our package and layer doesn't contain spaces, and the user's package
-      // name can't contain spaces. This makes what we're searching for less subject to change (e.g.
-      // if some adb versions print 'setting = value' instead of 'setting=value'
-      // This will even work if there are new lines
-      rdcstr checkString;
-      checkString.reserve(inString.size());
-      for(const char &c : inString)
+      layerConfigError = Android::ValidateGPUSettings(settings, check);
+      if(!layerConfigError.empty())
       {
-        if(c == ' ' || c == '\t' || c == '\r' || c == '\n')
-          continue;
-
-        checkString.push_back(c);
-      }
-
-      if(!checkString.contains("enable_gpu_debug_layers=1") ||
-         !checkString.contains("gpu_debug_app=" + packageName) ||
-         !checkString.contains("gpu_debug_layer_app=" + layerPackage) ||
-         !checkString.contains("gpu_debug_layers=" RENDERDOC_VULKAN_LAYER_NAME) ||
-         !checkString.contains("gpu_debug_layers_gles=" RENDERDOC_ANDROID_LIBRARY))
-      {
-        info =
-            "Do you have a strange device that requires extra setup?\n"
-            "E.g. Xiaomi requires a developer account and \"USB debugging (Security Settings)\"";
-
-        RDCERR("Couldn't verify that debug settings are set:\n%s\n%s", inString.c_str(),
-               info.c_str());
+        RDCERR("Couldn't verify GPU debug settings using adb '%s':\n%s",
+               Android::getToolPath(Android::ToolDir::PlatformTools, "adb", false).c_str(),
+               layerConfigError.c_str());
+        for(const Android::GPUSetting &setting : settings)
+          RDCERR("settings put global %s %s: exit %d\nstdout: %s\nstderr: %s", setting.name.c_str(),
+                 setting.value.c_str(), setting.writeResult.retCode,
+                 setting.writeResult.strStdout.c_str(), setting.writeResult.strStderror.c_str());
+        RDCERR("settings list global: exit %d\nstdout: %s\nstderr: %s", check.retCode,
+               check.strStdout.c_str(), check.strStderror.c_str());
 
         result = RDResult(ResultCode::AndroidLayerConfFailed);
-        result.message = info;
 
         hookWithJDWP = true;
 
@@ -1579,14 +1576,8 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
 
       RDCERR("Couldn't get PID");
 
-      if(!info.empty())
-        result.message =
-            "Couldn't locate the launched activity, either it failed to launch or crashed."
-            "\n\nAdditional information:\n" +
-            info;
-      else
-        result.message =
-            "Couldn't locate the launched activity, either it failed to launch or crashed.";
+      result.message =
+          "Couldn't locate the launched activity, either it failed to launch or crashed.";
 
       return;
     }
@@ -1608,13 +1599,11 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
         // If layer configuration failed first, then report that to the user as it is usually easier
         // to fix
         if(result.code != ResultCode::AndroidLayerConfFailed)
-        {
           result = RDResult(ResultCode::JDWPFailure);
-          result.message = StringFormat::Fmt(
-              "Failed to inject using JDWP when launching '%s' with activity '%s' and intent args "
-              "'%s'",
-              packageName.c_str(), activityName.c_str(), intentArgs.c_str());
-        }
+        result.message = StringFormat::Fmt(
+            "Failed to inject using JDWP when launching '%s' with activity '%s' and intent args "
+            "'%s'",
+            packageName.c_str(), activityName.c_str(), intentArgs.c_str());
         return;
       }
     }
@@ -1658,6 +1647,9 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
 
     return;
   });
+
+  // Append after all launch paths, so an early return or a timeout cannot lose the first failure.
+  Android::AppendGPUSettingsError(result, layerConfigError);
 
   Atomic::Inc32(&done);
 
