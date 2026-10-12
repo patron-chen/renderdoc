@@ -236,10 +236,14 @@ if(ANDROID)
 
     # Copy in android package files, replacing the package name with the architecture-specific package name
     configure_file(android/Loader.java ${CMAKE_CURRENT_BINARY_DIR}/src/org/renderdoc/renderdoccmd/Loader.java)
+    configure_file(android/RemoteServerService.java ${CMAKE_CURRENT_BINARY_DIR}/src/org/renderdoc/renderdoccmd/RemoteServerService.java)
     configure_file(android/AndroidManifest.xml ${CMAKE_CURRENT_BINARY_DIR}/AndroidManifest.xml)
     configure_file(android/icon.png ${CMAKE_CURRENT_BINARY_DIR}/res/drawable/icon.png COPYONLY)
 
     add_custom_command(OUTPUT ${APK_FILE}
+                       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/src/org/renderdoc/renderdoccmd/Loader.java
+                       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/src/org/renderdoc/renderdoccmd/RemoteServerService.java
+                       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/AndroidManifest.xml
                        DEPENDS renderdoc
                        DEPENDS renderdoccmd
                        DEPENDS ${KEYSTORE}
