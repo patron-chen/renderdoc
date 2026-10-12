@@ -54,6 +54,15 @@ rdcstr GetFirstMatchingLine(const rdcstr &haystack, const rdcstr &needle);
 
 bool IsSupported(rdcstr deviceID);
 bool SupportsNativeLayers(const rdcstr &deviceID);
+struct GPUSetting
+{
+  rdcstr name, value;
+  Process::ProcessResult writeResult;
+};
+rdcstr ValidateGPUSettings(const rdcarray<GPUSetting> &settings,
+                          const Process::ProcessResult &readResult);
+void AppendGPUSettingsError(RDResult &result, const rdcstr &error);
+bool IsServerQueryable(const rdcstr &queries, const rdcstr &packageName);
 rdcstr DetermineInstalledABI(const rdcstr &deviceID, const rdcstr &packageName);
 rdcstr GetFriendlyName(const rdcstr &deviceID);
 

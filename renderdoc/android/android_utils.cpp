@@ -32,6 +32,116 @@
 
 namespace Android
 {
+static rdcstr DescribeADBError(const Process::ProcessResult &result)
+{
+  rdcstr description = StringFormat::Fmt("exit code %d", result.retCode);
+  rdcarray<rdcstr> lines;
+  split(result.strStdout + "\n" + result.strStderror, lines, '\n');
+  // Keep the error itself in the dialog; the full Java stack is retained in the log.
+  uint32_t count = 0;
+  for(const rdcstr &line : lines)
+  {
+    rdcstr trimmed = line.trimmed();
+    if(trimmed.empty())
+      continue;
+    description += "\n" + trimmed;
+    if(++count == 2)
+      break;
+  }
+  return description;
+}
+
+rdcstr ValidateGPUSettings(const rdcarray<GPUSetting> &settings,
+                           const Process::ProcessResult &readResult)
+{
+  rdcarray<rdcstr> lines;
+  // Older adb versions can put shell output on stderr.
+  split(readResult.strStdout + "\n" + readResult.strStderror, lines, '\n');
+  for(rdcstr &line : lines)
+  {
+    rdcstr compact;
+    for(char c : line)
+      if(c != ' ' && c != '\t' && c != '\r')
+        compact.push_back(c);
+    line = compact;
+  }
+
+  rdcstr error;
+  if(readResult.retCode != 0)
+    error = "Read command: adb shell settings list global\n" + DescribeADBError(readResult) + "\n";
+
+  bool permissionDenied = false;
+  for(const GPUSetting &setting : settings)
+  {
+    rdcstr actual = "<missing>";
+    for(const rdcstr &line : lines)
+    {
+      int separator = line.find('=');
+      if(separator >= 0 && line.substr(0, separator) == setting.name)
+      {
+        actual = line.substr(separator + 1);
+        break;
+      }
+    }
+
+    rdcstr output = setting.writeResult.strStdout + "\n" + setting.writeResult.strStderror;
+    permissionDenied |=
+        output.contains("WRITE_SECURE_SETTINGS") || output.contains("SecurityException");
+    // Some older adb clients return zero even when Android reports a SecurityException.
+    bool writeFailed = setting.writeResult.retCode != 0 || output.contains("SecurityException");
+    if(actual != setting.value || writeFailed)
+    {
+      error += StringFormat::Fmt(
+          "\n%s: expected '%s', actual '%s'\n"
+          "Write command: adb shell settings put global %s %s\n%s\n",
+          setting.name.c_str(), setting.value.c_str(), actual.c_str(), setting.name.c_str(),
+          setting.value.c_str(), DescribeADBError(setting.writeResult).c_str());
+    }
+  }
+
+  if(!error.empty())
+  {
+    error = "Android GPU debug layer configuration failed.\n" + error;
+    if(permissionDenied)
+      error +=
+          "\nAndroid refused permission to write GPU debug settings. Check the device's "
+          "developer options: on OnePlus/OPPO enable 'Disable permission monitoring'; "
+          "on Xiaomi enable 'USB debugging (Security Settings)'. Then reconnect and retry.";
+    else
+      error +=
+          "\nCheck the adb connection and USB debugging authorization. Use the same Android "
+          "SDK adb for RenderDoc and other tools, and verify these settings can be written.";
+  }
+  return error;
+}
+
+void AppendGPUSettingsError(RDResult &result, const rdcstr &error)
+{
+  if(result != ResultCode::Succeeded && !error.empty())
+    result.message = rdcstr(result.message) + "\n\nGPU debug layer diagnostics:\n" + error;
+}
+
+bool IsServerQueryable(const rdcstr &queries, const rdcstr &packageName)
+{
+  rdcarray<rdcstr> lines;
+  split(queries, lines, '\n');
+  bool inSection = false;
+  for(const rdcstr &line : lines)
+  {
+    rdcstr trimmed = line.trimmed();
+    if(trimmed == "forceQueryable:")
+      inSection = true;
+    else if(inSection)
+    {
+      if(trimmed.endsWith(":"))
+        break;
+      if(trimmed == packageName)
+        return true;
+    }
+  }
+  return false;
+}
+
 bool IsHostADB(const char *hostname)
 {
   return !strncmp(hostname, "adb:", 4);
@@ -784,6 +894,157 @@ rdcstr DoStringise(const Android::ABI &el)
 #undef None
 
 #include "catch/catch.hpp"
+
+TEST_CASE("GPU debug settings are verified exactly and report adb failures", "[android]")
+{
+  using namespace Android;
+  rdcarray<GPUSetting> settings = {
+      {"enable_gpu_debug_layers", "1", {}},
+      {"gpu_debug_app", "com.example.game", {}},
+      {"gpu_debug_layer_app", "org.renderdoc.renderdoccmd.arm64", {}},
+      {"gpu_debug_layers", "VK_LAYER_RENDERDOC_Capture", {}},
+      {"gpu_debug_layers_gles", "libVkLayer_GLES_RenderDoc.so", {}},
+  };
+  Process::ProcessResult read = {};
+  read.strStdout =
+      "enable_gpu_debug_layers=1\n"
+      "gpu_debug_app=com.example.game\n"
+      "gpu_debug_layer_app=org.renderdoc.renderdoccmd.arm64\n"
+      "gpu_debug_layers=VK_LAYER_RENDERDOC_Capture\n"
+      "gpu_debug_layers_gles=libVkLayer_GLES_RenderDoc.so\n";
+
+  SECTION("Correct settings")
+  {
+    CHECK(ValidateGPUSettings(settings, read).empty());
+  }
+  SECTION("Whitespace and old adb stderr output")
+  {
+    read.strStdout.clear();
+    read.strStderror =
+        " enable_gpu_debug_layers = 1\r\n"
+        "gpu_debug_app\t=\tcom.example.game\r\n"
+        "gpu_debug_layer_app = org.renderdoc.renderdoccmd.arm64\r\n"
+        "gpu_debug_layers = VK_LAYER_RENDERDOC_Capture\r\n"
+        "gpu_debug_layers_gles = libVkLayer_GLES_RenderDoc.so\r\n";
+    CHECK(ValidateGPUSettings(settings, read).empty());
+  }
+  SECTION("Missing key cannot match a suffix of another key")
+  {
+    read.strStdout = "other_gpu_debug_app=com.example.game\n";
+    CHECK(ValidateGPUSettings(settings, read)
+              .contains("gpu_debug_app: expected 'com.example.game', actual '<missing>'"));
+  }
+  SECTION("Similar package names cannot match a prefix")
+  {
+    read.strStdout = "gpu_debug_app=com.example.game.extra\n";
+    CHECK(ValidateGPUSettings(settings, read).contains("actual 'com.example.game.extra'"));
+  }
+  SECTION("Numeric values cannot match a prefix")
+  {
+    read.strStdout = "enable_gpu_debug_layers=10\n";
+    CHECK(ValidateGPUSettings(settings, read).contains("expected '1', actual '10'"));
+  }
+  SECTION("Similar layer names are rejected")
+  {
+    read.strStdout =
+        "gpu_debug_layer_app=org.renderdoc.renderdoccmd.arm64.extra\n"
+        "gpu_debug_layers=VK_LAYER_RENDERDOC_Capture_extra\n"
+        "gpu_debug_layers_gles=libVkLayer_GLES_RenderDoc.so.extra\n";
+    rdcstr error = ValidateGPUSettings(settings, read);
+    CHECK(error.contains("actual 'org.renderdoc.renderdoccmd.arm64.extra'"));
+    CHECK(error.contains("actual 'VK_LAYER_RENDERDOC_Capture_extra'"));
+    CHECK(error.contains("actual 'libVkLayer_GLES_RenderDoc.so.extra'"));
+  }
+  SECTION("Separate lines cannot fabricate a setting")
+  {
+    read.strStdout = "gpu_debug_\napp=com.example.game\n";
+    CHECK(ValidateGPUSettings(settings, read)
+              .contains("gpu_debug_app: expected 'com.example.game', actual '<missing>'"));
+  }
+  SECTION("Read failure even with stale matching output")
+  {
+    read.retCode = 1;
+    read.strStderror = "adb.exe: device offline";
+    rdcstr error = ValidateGPUSettings(settings, read);
+    CHECK(error.contains("Read command: adb shell settings list global"));
+    CHECK(error.contains("exit code 1"));
+    // Readback values cannot make a failed read command successful.
+    CHECK_FALSE(ValidateGPUSettings(settings, read).empty());
+    read.strStdout.clear();
+    CHECK(ValidateGPUSettings(settings, read).contains("device offline"));
+  }
+  SECTION("Permission denial includes command and device guidance")
+  {
+    settings[0].writeResult.retCode = 255;
+    settings[0].writeResult.strStderror =
+        "\nException occurred while executing 'put':\n"
+        "java.lang.SecurityException: Permission denial: android.permission.WRITE_SECURE_SETTINGS\n"
+        "\tat SettingsProvider.enforceHasAtLeastOnePermission(SettingsProvider.java:2705)\n";
+    rdcstr error = ValidateGPUSettings(settings, read);
+    CHECK(error.contains("Write command: adb shell settings put global enable_gpu_debug_layers 1"));
+    CHECK(error.contains("exit code 255"));
+    CHECK(error.contains("WRITE_SECURE_SETTINGS"));
+    CHECK(error.contains("Disable permission monitoring"));
+    CHECK_FALSE(error.contains("SettingsProvider.java"));
+  }
+  SECTION("Old adb zero exit code does not hide a SecurityException")
+  {
+    settings[1].writeResult.strStdout = "java.lang.SecurityException: WRITE_SECURE_SETTINGS";
+    CHECK(ValidateGPUSettings(settings, read).contains("WRITE_SECURE_SETTINGS"));
+  }
+  SECTION("Transport failure is retained even with matching settings")
+  {
+    settings[1].writeResult.retCode = 1;
+    settings[1].writeResult.strStderror = "adb.exe: device unauthorized";
+    CHECK(ValidateGPUSettings(settings, read).contains("device unauthorized"));
+  }
+}
+
+TEST_CASE("GPU debug diagnostics survive failed fallback but not successful fallback", "[android]")
+{
+  const rdcstr diagnostics = "WRITE_SECURE_SETTINGS denied";
+  SECTION("Successful fallback")
+  {
+    RDResult result(ResultCode::Succeeded);
+    Android::AppendGPUSettingsError(result, diagnostics);
+    CHECK(result.code == ResultCode::Succeeded);
+    CHECK(result.message.empty());
+  }
+  SECTION("Failed JDWP, launch, crash or timeout")
+  {
+    for(ResultCode code :
+        {ResultCode::AndroidLayerConfFailed, ResultCode::JDWPFailure, ResultCode::InjectionFailed})
+    {
+      RDResult result(code, "Fallback failure");
+      Android::AppendGPUSettingsError(result, diagnostics);
+      CHECK(result.code == code);
+      CHECK(rdcstr(result.message).contains("Fallback failure"));
+      CHECK(rdcstr(result.message).contains(diagnostics));
+    }
+  }
+  SECTION("No configuration failure")
+  {
+    RDResult result(ResultCode::JDWPFailure, "JDWP failure");
+    Android::AppendGPUSettingsError(result, "");
+    CHECK(result.message == "JDWP failure");
+  }
+}
+
+TEST_CASE("RenderDoc server must be listed in the forceQueryable section", "[android]")
+{
+  const rdcstr packageName = "org.renderdoc.renderdoccmd.arm64";
+  CHECK(Android::IsServerQueryable("  forceQueryable:\r\n    " + packageName +
+                                      "\r\n  queries via package name:\r\n",
+                                  packageName));
+  CHECK_FALSE(Android::IsServerQueryable("  forceQueryable:\n    " + packageName +
+                                            ".extra\n  queries via package name:\n    " + packageName,
+                                        packageName));
+  CHECK_FALSE(Android::IsServerQueryable("  queries via forceQueryable:\n    " + packageName +
+                                            "\n  forceQueryable:\n    com.android.shell\n"
+                                            "  queries via package name:\n    " + packageName,
+                                        packageName));
+  CHECK_FALSE(Android::IsServerQueryable("adb.exe: device offline", packageName));
+}
 
 TEST_CASE("Test that log line parsing is robust", "[android]")
 {
