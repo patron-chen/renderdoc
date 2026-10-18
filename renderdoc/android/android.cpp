@@ -181,10 +181,56 @@ int GetCurrentPID(const rdcstr &deviceID, const rdcstr &processName)
     RDCLOG("Getting PID from device %s for process '%s'", deviceID.c_str(), processName.c_str());
   }
 
+  bool hasRoot = Android::HasRootAccess(deviceID);
+
   // try 15 times, 200ms apart to find the pid, for a total of 3 seconds timeout waiting for the
   // process to even be alive
   for(int i = 0; i < 15; i++)
   {
+    // Try pidof first (fast and direct)
+    Process::ProcessResult pidofRes =
+        adbExecCommand(deviceID, StringFormat::Fmt("shell pidof -s %s", processName.c_str()), ".", true);
+    rdcstr pidofOut = pidofRes.strStdout.trimmed();
+    if(pidofOut.empty())
+    {
+      pidofRes =
+          adbExecCommand(deviceID, StringFormat::Fmt("shell pidof %s", processName.c_str()), ".", true);
+      pidofOut = pidofRes.strStdout.trimmed();
+    }
+    if(!pidofOut.empty() && isdigit(pidofOut[0]))
+    {
+      int p = atoi(pidofOut.c_str());
+      if(p > 0)
+      {
+        if(Android_Debug_ProcessLaunch())
+          RDCLOG("Found PID %d via pidof", p);
+        return p;
+      }
+    }
+
+    if(hasRoot)
+    {
+      Process::ProcessResult suPidof =
+          adbExecSuCommand(deviceID, StringFormat::Fmt("pidof -s %s", processName.c_str()), ".", true);
+      rdcstr suPidofOut = suPidof.strStdout.trimmed();
+      if(suPidofOut.empty())
+      {
+        suPidof =
+            adbExecSuCommand(deviceID, StringFormat::Fmt("pidof %s", processName.c_str()), ".", true);
+        suPidofOut = suPidof.strStdout.trimmed();
+      }
+      if(!suPidofOut.empty() && isdigit(suPidofOut[0]))
+      {
+        int p = atoi(suPidofOut.c_str());
+        if(p > 0)
+        {
+          if(Android_Debug_ProcessLaunch())
+            RDCLOG("Found PID %d via root pidof", p);
+          return p;
+        }
+      }
+    }
+
     Process::ProcessResult pidOutput =
         adbExecCommand(deviceID, StringFormat::Fmt("shell ps -A | grep %s", processName.c_str()));
 
@@ -640,6 +686,15 @@ void ResetCaptureSettings(const rdcstr &deviceID)
   Android::adbExecCommand(deviceID, "shell settings delete global gpu_debug_layer_app", ".", true);
   Android::adbExecCommand(deviceID, "shell settings delete global gpu_debug_layers", ".", true);
   Android::adbExecCommand(deviceID, "shell settings delete global gpu_debug_layers_gles", ".", true);
+
+  if(Android::HasRootAccess(deviceID))
+  {
+    Android::adbExecSuCommand(deviceID, "settings delete global enable_gpu_debug_layers", ".", true);
+    Android::adbExecSuCommand(deviceID, "settings delete global gpu_debug_app", ".", true);
+    Android::adbExecSuCommand(deviceID, "settings delete global gpu_debug_layer_app", ".", true);
+    Android::adbExecSuCommand(deviceID, "settings delete global gpu_debug_layers", ".", true);
+    Android::adbExecSuCommand(deviceID, "settings delete global gpu_debug_layers_gles", ".", true);
+  }
 }
 
 rdcarray<rdcstr> EnumerateDevices()
@@ -701,6 +756,12 @@ struct AndroidRemoteServer : public RemoteServer
 
     // enable profiling to measure hardware counters
     Android::adbExecCommand(m_deviceID, "shell setprop security.perf_harden 0");
+    if(Android::HasRootAccess(m_deviceID))
+    {
+      Android::adbExecSuCommand(m_deviceID, "setprop security.perf_harden 0", ".", true);
+      Android::adbExecSuCommand(m_deviceID, "setenforce 0", ".", true);
+      Android::adbExecSuCommand(m_deviceID, "svc power stayon true", ".", true);
+    }
 
     LazilyStartLogcatThread();
 
@@ -711,6 +772,10 @@ struct AndroidRemoteServer : public RemoteServer
   {
     // disable profiling
     Android::adbExecCommand(m_deviceID, "shell setprop security.perf_harden 1");
+    if(Android::HasRootAccess(m_deviceID))
+    {
+      Android::adbExecSuCommand(m_deviceID, "setprop security.perf_harden 1", ".", true);
+    }
 
     RemoteServer::CloseCapture(rend);
   }
@@ -1233,15 +1298,47 @@ struct AndroidController : public IDeviceProtocolHandler
       for(Android::ABI abi : abis)
         Android::adbExecCommand(deviceID, "shell am force-stop " + GetRenderDocPackageForABI(abi));
 
+      bool hasRoot = Android::HasRootAccess(deviceID);
+      if(hasRoot)
+      {
+        RDCLOG("Root access available on %s: configuring server environment for replay and capture",
+               deviceID.c_str());
+        Android::adbExecSuCommand(
+            deviceID,
+            "resetprop ro.debuggable 1 || magisk resetprop ro.debuggable 1 || setprop ro.debuggable 1");
+        Android::adbExecSuCommand(
+            deviceID,
+            "resetprop ro.force.debuggable 1 || magisk resetprop ro.force.debuggable 1 || setprop "
+            "ro.force.debuggable 1");
+        Android::adbExecSuCommand(deviceID, "setenforce 0");
+        Android::adbExecSuCommand(deviceID, "svc power stayon true");
+      }
+
       // Attempt to prevent the user needing to click through on permissions
       rdcstr auto_grant_permissions =
           Android::adbExecCommand(deviceID, "shell getprop debug.renderdoc.autograntpermissions")
               .strStdout.trimmed();
-      if(apiVersion >= 30 && atoi(auto_grant_permissions.c_str()) == 1)
+      if(apiVersion >= 30 || hasRoot)
       {
         for(Android::ABI abi : abis)
-          Android::adbExecCommand(deviceID, "shell pm grant " + GetRenderDocPackageForABI(abi) +
-                                                " android.permission.MANAGE_EXTERNAL_STORAGE");
+        {
+          rdcstr srvPkg = GetRenderDocPackageForABI(abi);
+          Android::adbExecCommand(deviceID, "shell appops set " + srvPkg + " MANAGE_EXTERNAL_STORAGE allow");
+          if(hasRoot)
+          {
+            Android::adbExecSuCommand(deviceID,
+                                      "appops set " + srvPkg + " MANAGE_EXTERNAL_STORAGE allow");
+            Android::adbExecSuCommand(deviceID, "pm grant " + srvPkg +
+                                                    " android.permission.READ_EXTERNAL_STORAGE");
+            Android::adbExecSuCommand(deviceID, "pm grant " + srvPkg +
+                                                    " android.permission.WRITE_EXTERNAL_STORAGE");
+          }
+          else if(atoi(auto_grant_permissions.c_str()) == 1)
+          {
+            Android::adbExecCommand(deviceID, "shell pm grant " + srvPkg +
+                                                  " android.permission.MANAGE_EXTERNAL_STORAGE");
+          }
+        }
       }
 
       Android::adbForwardPorts(dev.portbase, deviceID, 0, 0, false);
@@ -1264,11 +1361,32 @@ struct AndroidController : public IDeviceProtocolHandler
                                             "\" /sdcard/Android/" + folderName + package +
                                             "/files/renderdoc.conf");
 
+      if(hasRoot)
+      {
+        Android::adbExecSuCommand(deviceID,
+                                  "mkdir -p /sdcard/Android/" + folderName + package + "/files");
+        Android::adbExecSuCommand(deviceID,
+                                  "chmod -R 777 /sdcard/Android/" + folderName + package);
+        Android::adbExecCommand(deviceID, "push \"" +
+                                              FileIO::GetAppFolderFilename("renderdoc.conf") +
+                                              "\" /data/local/tmp/renderdoc.conf",
+                                ".", true);
+        Android::adbExecSuCommand(deviceID, "cp /data/local/tmp/renderdoc.conf /sdcard/Android/" +
+                                                folderName + package + "/files/renderdoc.conf");
+        Android::adbExecSuCommand(deviceID, "chmod 666 /sdcard/Android/" + folderName + package +
+                                                "/files/renderdoc.conf");
+      }
+
       // launch the last ABI, as the 64-bit version where possible, or 32-bit version where not.
       // Captures are portable across bitness and in some cases a 64-bit capture can't replay on a
       // 32-bit remote server.
-      Android::adbExecCommand(
+      Process::ProcessResult serverLaunch = Android::adbExecCommand(
           deviceID, "shell am start -n " + package + "/.Loader -e renderdoccmd remoteserver");
+      if(serverLaunch.retCode != 0 && hasRoot)
+      {
+        Android::adbExecSuCommand(
+            deviceID, "am start -n " + package + "/.Loader -e renderdoccmd remoteserver");
+      }
     });
 
     // allow the package to start and begin listening before we return
@@ -1399,6 +1517,37 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
     Android::adbExecCommand(m_deviceID, "shell am force-stop " + processName);
     Android::adbExecCommand(m_deviceID, "shell setprop debug.vulkan.layers :", ".", true);
 
+    bool hasRoot = Android::HasRootAccess(m_deviceID);
+    if(hasRoot)
+    {
+      RDCLOG(
+          "Root access available on %s: configuring ro.debuggable, SELinux, and permissions for "
+          "release app capture",
+          m_deviceID.c_str());
+      // 1. ro.debuggable: Android GraphicsEnvironment checks isDebuggable() / ro.debuggable == 1.
+      // If ro.debuggable == 1, GPU debug layers are loaded even for release (non-debuggable) APKs!
+      Android::adbExecSuCommand(
+          m_deviceID,
+          "resetprop ro.debuggable 1 || magisk resetprop ro.debuggable 1 || setprop ro.debuggable 1");
+      Android::adbExecSuCommand(
+          m_deviceID,
+          "resetprop ro.force.debuggable 1 || magisk resetprop ro.force.debuggable 1 || setprop "
+          "ro.force.debuggable 1");
+
+      // 2. SELinux: Set to permissive mode so target application can load RenderDoc layer libraries
+      Android::adbExecSuCommand(m_deviceID, "setenforce 0");
+
+      // 3. Prevent screen sleep during capture
+      Android::adbExecSuCommand(m_deviceID, "svc power stayon true");
+
+      // 4. Grant MANAGE_EXTERNAL_STORAGE and storage permissions
+      Android::adbExecSuCommand(m_deviceID,
+                                "appops set " + packageName + " MANAGE_EXTERNAL_STORAGE allow");
+      if(processName != packageName)
+        Android::adbExecSuCommand(m_deviceID,
+                                  "appops set " + processName + " MANAGE_EXTERNAL_STORAGE allow");
+    }
+
     bool hookWithJDWP = true;
 
     if(Android::SupportsNativeLayers(m_deviceID))
@@ -1432,6 +1581,12 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
       }
 
       rdcstr layerPackage = GetRenderDocPackageForABI(abi);
+      if(hasRoot)
+      {
+        Android::adbExecSuCommand(m_deviceID,
+                                  "appops set " + layerPackage + " MANAGE_EXTERNAL_STORAGE allow");
+      }
+
       rdcarray<Android::GPUSetting> settings = {
           {"enable_gpu_debug_layers", "1", {}},
           {"gpu_debug_app", packageName, {}},
@@ -1440,14 +1595,28 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
           {"gpu_debug_layers_gles", RENDERDOC_ANDROID_LIBRARY, {}},
       };
       for(Android::GPUSetting &setting : settings)
+      {
         setting.writeResult = Android::adbExecCommand(
             m_deviceID, "shell settings put global " + setting.name + " " + setting.value);
+        if((setting.writeResult.retCode != 0 ||
+            setting.writeResult.strStdout.contains("SecurityException") ||
+            setting.writeResult.strStderror.contains("SecurityException")) &&
+           hasRoot)
+        {
+          setting.writeResult = Android::adbExecSuCommand(
+              m_deviceID, "settings put global " + setting.name + " " + setting.value);
+        }
+      }
 
       // don't ignore the layers by default, only if we encounter an error
       Android::adbExecCommand(m_deviceID, "shell setprop debug.rdoc.IGNORE_LAYERS 0");
 
       Process::ProcessResult check =
           Android::adbExecCommand(m_deviceID, "shell settings list global");
+      if(check.retCode != 0 && hasRoot)
+      {
+        check = Android::adbExecSuCommand(m_deviceID, "settings list global");
+      }
 
       layerConfigError = Android::ValidateGPUSettings(settings, check);
       if(!layerConfigError.empty())
@@ -1507,6 +1676,23 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
                                             "\" /sdcard/Android/" + folderName + processName +
                                             "/files/renderdoc.conf");
 
+    if(hasRoot)
+    {
+      Android::adbExecSuCommand(
+          m_deviceID, "mkdir -p /sdcard/Android/" + folderName + processName + "/files");
+      Android::adbExecSuCommand(m_deviceID,
+                                "chmod -R 777 /sdcard/Android/" + folderName + processName);
+
+      Android::adbExecCommand(m_deviceID, "push \"" +
+                                              FileIO::GetAppFolderFilename("renderdoc.conf") +
+                                              "\" /data/local/tmp/renderdoc.conf",
+                              ".", true);
+      Android::adbExecSuCommand(m_deviceID, "cp /data/local/tmp/renderdoc.conf /sdcard/Android/" +
+                                                folderName + processName + "/files/renderdoc.conf");
+      Android::adbExecSuCommand(m_deviceID, "chmod 666 /sdcard/Android/" + folderName +
+                                                processName + "/files/renderdoc.conf");
+    }
+
     rdcstr installedPath = Android::GetPathForPackage(m_deviceID, packageName);
 
     rdcstr RDCLib = Android::adbExecCommand(m_deviceID, "shell ls " + installedPath +
@@ -1544,23 +1730,36 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
     RDCLOG("Launching package '%s' with activity '%s' and intent args '%s'", packageName.c_str(),
            activityName.c_str(), intentArgs.c_str());
 
+    Process::ProcessResult startResult;
     if(hookWithJDWP)
     {
       RDCLOG("Setting up to launch the application as a debugger to inject.");
 
       // start the activity in this package with debugging enabled and force-stop after starting
-      Android::adbExecCommand(
+      startResult = Android::adbExecCommand(
           m_deviceID, StringFormat::Fmt("shell am start -S -D -n %s/%s %s", packageName.c_str(),
                                         activityName.c_str(), intentArgs.c_str()));
+      if(startResult.retCode != 0 && hasRoot)
+      {
+        startResult = Android::adbExecSuCommand(
+            m_deviceID, StringFormat::Fmt("am start -S -D -n %s/%s %s", packageName.c_str(),
+                                          activityName.c_str(), intentArgs.c_str()));
+      }
     }
     else
     {
       RDCLOG("Launching APK with no debugger or direct injection.");
 
       // start the activity in this package with debugging enabled and force-stop after starting
-      Android::adbExecCommand(
+      startResult = Android::adbExecCommand(
           m_deviceID, StringFormat::Fmt("shell am start -S -n %s/%s %s", packageName.c_str(),
                                         activityName.c_str(), intentArgs.c_str()));
+      if(startResult.retCode != 0 && hasRoot)
+      {
+        startResult = Android::adbExecSuCommand(
+            m_deviceID, StringFormat::Fmt("am start -S -n %s/%s %s", packageName.c_str(),
+                                          activityName.c_str(), intentArgs.c_str()));
+      }
 
       // don't connect JDWP
       jdwpPort = 0;
@@ -1678,7 +1877,13 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_CheckAndroidPackage(
   // Reset the flags each time we check
   *flags = AndroidFlags::NoFlags;
 
-  if(Android::IsDebuggable(deviceID, Android::GetPackageName(packageAndActivity)))
+  bool isDebug = Android::IsDebuggable(deviceID, Android::GetPackageName(packageAndActivity));
+  rdcstr propDebug =
+      Android::adbExecCommand(deviceID, "shell getprop ro.debuggable", ".", true).strStdout.trimmed();
+  if(propDebug == "1")
+    isDebug = true;
+
+  if(isDebug)
   {
     *flags |= AndroidFlags::Debuggable;
   }

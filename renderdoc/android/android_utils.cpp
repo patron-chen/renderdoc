@@ -388,20 +388,55 @@ bool HasRootAccess(const rdcstr &deviceID)
 {
   RDCLOG("Checking for root access on %s", deviceID.c_str());
 
-  // Try switching adb to root and check a few indicators for success
-  // Nothing will fall over if we get a false positive here, it just enables
-  // additional methods of getting things set up.
-
-  Process::ProcessResult result = adbExecCommand(deviceID, "root");
-
-  rdcstr whoami = adbExecCommand(deviceID, "shell whoami").strStdout.trimmed();
+  // 1. Check if adbd is already running as root
+  rdcstr whoami = adbExecCommand(deviceID, "shell whoami", ".", true).strStdout.trimmed();
   if(whoami == "root")
+  {
+    RDCLOG("Device %s already running as root", deviceID.c_str());
     return true;
+  }
 
-  rdcstr checksu =
-      adbExecCommand(deviceID, "shell test -e /system/xbin/su && echo found").strStdout.trimmed();
-  if(checksu == "found")
+  // 2. Try switching adb to root (works on userdebug/eng builds)
+  adbExecCommand(deviceID, "root", ".", true);
+  whoami = adbExecCommand(deviceID, "shell whoami", ".", true).strStdout.trimmed();
+  if(whoami == "root")
+  {
+    RDCLOG("Device %s switched to adb root", deviceID.c_str());
     return true;
+  }
+
+  // 3. Test modern su (Magisk, KernelSU, APatch) via "su -c id"
+  Process::ProcessResult suResult = adbExecCommand(deviceID, "shell su -c id", ".", true);
+  if(suResult.strStdout.contains("uid=0") || suResult.strStdout.contains("(root)"))
+  {
+    RDCLOG("Root access verified via su -c id on %s", deviceID.c_str());
+    return true;
+  }
+
+  // 4. Test su 0 id
+  suResult = adbExecCommand(deviceID, "shell su 0 id", ".", true);
+  if(suResult.strStdout.contains("uid=0") || suResult.strStdout.contains("(root)"))
+  {
+    RDCLOG("Root access verified via su 0 id on %s", deviceID.c_str());
+    return true;
+  }
+
+  // 5. Test which su
+  rdcstr whichSu = adbExecCommand(deviceID, "shell which su", ".", true).strStdout.trimmed();
+  if(!whichSu.empty() && !whichSu.contains("not found"))
+  {
+    RDCLOG("su binary found at '%s' on %s", whichSu.c_str(), deviceID.c_str());
+    return true;
+  }
+
+  // 6. Fallback legacy /system/xbin/su check
+  rdcstr checksu =
+      adbExecCommand(deviceID, "shell test -e /system/xbin/su && echo found", ".", true).strStdout.trimmed();
+  if(checksu == "found")
+  {
+    RDCLOG("Legacy su found on %s", deviceID.c_str());
+    return true;
+  }
 
   return false;
 }

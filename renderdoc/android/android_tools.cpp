@@ -336,6 +336,21 @@ Process::ProcessResult adbExecCommand(const rdcstr &device, const rdcstr &args,
     deviceArgs = StringFormat::Fmt("-s %s %s", device.c_str(), args.c_str());
   return execCommand(adb, deviceArgs, workDir, silent);
 }
+Process::ProcessResult adbExecSuCommand(const rdcstr &device, const rdcstr &cmd,
+                                        const rdcstr &workDir, bool silent)
+{
+  rdcstr escapedCmd;
+  escapedCmd.reserve(cmd.size() + 16);
+  for(char c : cmd)
+  {
+    if(c == '\\' || c == '\"')
+      escapedCmd.push_back('\\');
+    escapedCmd.push_back(c);
+  }
+
+  rdcstr suArgs = StringFormat::Fmt("shell su -c \"%s\"", escapedCmd.c_str());
+  return adbExecCommand(device, suArgs, workDir, silent);
+}
 void initAdb()
 {
   // we don't use adbExecCommand because we need to be sure we don't wait for it to exit

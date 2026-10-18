@@ -6,7 +6,13 @@ if /I "%~1"=="--help" goto :help
 if /I "%~1"=="help" goto :help
 
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_android_apks.ps1" %*
-exit /b %ERRORLEVEL%
+set "ERR=%ERRORLEVEL%"
+if %ERR% neq 0 (
+    echo.
+    echo [Build Error] Build failed with exit code %ERR%.
+    pause
+)
+exit /b %ERR%
 
 :help
 echo Build RenderDoc Android APKs for Windows development builds.
